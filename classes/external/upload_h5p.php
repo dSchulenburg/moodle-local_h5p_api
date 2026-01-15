@@ -19,6 +19,7 @@ namespace local_h5p_api\external;
 defined('MOODLE_INTERNAL') || die();
 
 require_once($CFG->libdir . '/externallib.php');
+require_once($CFG->dirroot . '/contentbank/classes/contentbank.php');
 
 use external_api;
 use external_function_parameters;
@@ -27,8 +28,6 @@ use external_single_structure;
 use context_system;
 use context_course;
 use core_contentbank\contentbank;
-use core_h5p\api as h5p_api;
-use core_h5p\factory as h5p_factory;
 
 /**
  * Upload H5P content to Moodle content bank
@@ -94,8 +93,8 @@ class upload_h5p extends external_api {
         }
 
         // Create temp file
-        $tempdir = make_temp_directory('h5p_api_upload');
-        $tempfile = $tempdir . '/' . $params['filename'];
+        $tempdir = make_temp_directory('local_h5p_api');
+        $tempfile = $tempdir . '/' . uniqid('h5p_') . '_' . $params['filename'];
         file_put_contents($tempfile, $filedata);
 
         try {
@@ -106,7 +105,8 @@ class upload_h5p extends external_api {
             $contenttypes = $cb->get_contenttypes_for_context($context);
             $h5ptype = null;
             foreach ($contenttypes as $type) {
-                if ($type->get_contenttype_name() === 'contenttype_h5p') {
+                $typename = get_class($type);
+                if (strpos($typename, 'contenttype_h5p') !== false || $type->get_contenttype_name() === 'contenttype_h5p') {
                     $h5ptype = $type;
                     break;
                 }
@@ -116,42 +116,27 @@ class upload_h5p extends external_api {
                 throw new \moodle_exception('h5pcontenttypenotfound', 'local_h5p_api');
             }
 
-            // Create file record
-            $fs = get_file_storage();
-            $filerecord = [
-                'contextid' => $context->id,
-                'component' => 'contentbank',
-                'filearea' => 'public',
-                'itemid' => 0,
-                'filepath' => '/',
-                'filename' => $params['filename'],
-                'userid' => $USER->id,
-            ];
+            // Prepare title
+            $contenttitle = !empty($params['title']) ? $params['title'] : pathinfo($params['filename'], PATHINFO_FILENAME);
 
-            // Store the file
-            $file = $fs->create_file_from_pathname($filerecord, $tempfile);
+            // Upload file using content type's upload method
+            $file = self::create_file_from_path($tempfile, $params['filename'], $context, $USER->id);
 
-            // Create content bank entry
-            $record = new \stdClass();
-            $record->name = !empty($params['title']) ? $params['title'] : pathinfo($params['filename'], PATHINFO_FILENAME);
-            $record->contextid = $context->id;
-            $record->usercreated = $USER->id;
-
-            $content = $h5ptype->create_content($record);
-
-            // Process the H5P file
-            $h5pfile = $content->get_file();
-            if ($h5pfile) {
-                // Move our uploaded file to replace the placeholder
-                $fs->delete_area_files($context->id, 'contentbank', 'public', $content->get_id());
-                $filerecord['itemid'] = $content->get_id();
-                $file = $fs->create_file_from_pathname($filerecord, $tempfile);
-            }
+            // Create content from the file
+            $content = $h5ptype->upload_content($file, ['name' => $contenttitle]);
 
             // Clean up temp file
             @unlink($tempfile);
 
-            // Get embed URL
+            if (!$content) {
+                throw new \moodle_exception('uploadfailed', 'local_h5p_api', '', 'Content creation failed');
+            }
+
+            // Get the stored file for embed URL
+            $storedfile = $content->get_file();
+            $storedfilename = $storedfile ? $storedfile->get_filename() : $params['filename'];
+
+            // Build embed URL
             $embedurl = $CFG->wwwroot . '/h5p/embed.php?url=' .
                         urlencode(\moodle_url::make_pluginfile_url(
                             $context->id,
@@ -159,7 +144,7 @@ class upload_h5p extends external_api {
                             'public',
                             $content->get_id(),
                             '/',
-                            $params['filename']
+                            $storedfilename
                         )->out(false));
 
             return [
@@ -176,6 +161,35 @@ class upload_h5p extends external_api {
             @unlink($tempfile);
             throw new \moodle_exception('uploadfailed', 'local_h5p_api', '', $e->getMessage());
         }
+    }
+
+    /**
+     * Create a stored_file from a path for upload
+     *
+     * @param string $filepath Path to the file
+     * @param string $filename Desired filename
+     * @param \context $context The context
+     * @param int $userid User ID
+     * @return \stored_file
+     */
+    private static function create_file_from_path($filepath, $filename, $context, $userid) {
+        $fs = get_file_storage();
+
+        // Use user draft area for temporary storage
+        $usercontext = \context_user::instance($userid);
+        $draftitemid = file_get_unused_draft_itemid();
+
+        $filerecord = [
+            'contextid' => $usercontext->id,
+            'component' => 'user',
+            'filearea' => 'draft',
+            'itemid' => $draftitemid,
+            'filepath' => '/',
+            'filename' => $filename,
+            'userid' => $userid,
+        ];
+
+        return $fs->create_file_from_pathname($filerecord, $filepath);
     }
 
     /**
